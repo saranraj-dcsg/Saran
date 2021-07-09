@@ -1,0 +1,329 @@
+Begin
+
+/***********------Variables for BM Qualified metrics--------------*************/
+declare D_event,D_offer,P_event,P_offer array<string>;
+declare D_sdt ,D_edt,P_sdt ,P_edt array<date>;
+declare i,j int64 default 1;
+
+/**********-------Variables for Online Qualified metrics---------*************/
+declare OD_event,OD_offer,OP_event,OP_offer array<string>;
+declare OD_sdt ,OD_edt,OP_sdt ,OP_edt array<date>;
+declare k,l int64 default 1;
+
+/**********---------Backup Public Table ---------------------**********/
+create or replace table `customer-mkt-data.u_dsg_public.fa_coupon_event_qualifying_transactions_Backup` as 
+select * from `customer-mkt-data.u_dsg_public.fa_coupon_event_qualifying_transactions`;
+
+/*********---------Create a temporary table of Take Rate Metadata with status flags----------*******/
+Create temp Table Takerate_matrix as (
+select *,case when Event_End_Date >= (current_date("America/New_York")-7) then "I" else "N" End as status_flag
+from `customer-mkt-data.u_dsg_saran.Weekend_Promo_Matrix` 
+);
+
+/********----------Delete all inflight coupon Codes from the Final table------------------********/
+delete `customer-mkt-data.u_dsg_public.fa_coupon_event_qualifying_transactions` where Coupon_Code in (select distinct coupon_code  from Takerate_matrix where status_flag='I');
+
+/**********-------Fetch only Pcodes from Take Rate Metadata Temp Table -----------**************/
+
+create temp table IData as (
+select distinct Coupon_Event_Id, Event_Start_Date, Event_End_Date, Coupon_Offer , Dollars_Flag,Percentage_Flag ,Qualifying_Dollars_1
+from(
+select distinct Coupon_Event_Id,Event_Start_Date,Event_End_Date,Coupon_Offer,Coupon_Code, Dollars_Flag,Percentage_Flag,Qualifying_Dollars_1
+from Takerate_matrix where coupon_code like '%P%' and  coupon_code not in (select distinct coupon_code from `customer-mkt-data.u_dsg_public.fa_coupon_event_qualifying_transactions`)
+
+)
+group by 1,2,3,4,5,6,7
+order by 1
+);
+
+
+/**********-------Fetch only Promo Id's from Take Rate Metadata Temp Table -----------**************/
+create temp table OData as (
+select distinct Coupon_Event_Id, Event_Start_Date, Event_End_Date, Coupon_Offer , Dollars_Flag,Percentage_Flag ,Qualifying_Dollars_1
+from(
+select distinct Coupon_Event_Id,Event_Start_Date,Event_End_Date,Coupon_Offer,Coupon_Code, Dollars_Flag,Percentage_Flag,Qualifying_Dollars_1
+from Takerate_matrix where Coupon_Code  not like '%P%' and coupon_code not in (select distinct coupon_code from  `customer-mkt-data.u_dsg_public.fa_coupon_event_qualifying_transactions`))
+group by 1,2,3,4,5,6,7
+order by 1
+);
+
+/****************-------------------initialize array for Pcodes-------------------**********/
+Set D_event=(select array_agg(Coupon_Event_Id order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Dollars_Flag =1);
+Set D_offer=(select array_agg(Coupon_Offer order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Dollars_Flag =1 );
+Set D_sdt=(select array_agg(Event_Start_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Dollars_Flag =1 );
+Set D_edt=(select array_agg(Event_End_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Dollars_Flag =1 );
+
+
+/*************-------------------Creating BM Table for Qualified Metrics----------****************/
+create or replace table `customer-mkt-data.u_dsg_saran.Qualified_transactions_BM` (
+Coupon_Event_Id string,Coupon_Offer string, Event_Start_Date date, Event_End_Date date,Transaction_date date, Qtrans int64,Qsales FLOAT64,Qcost FLOAT64 );
+
+/**********------------Qualified Transactions on Dollars Offer -------------*********/
+while i<=array_length(D_offer) do
+insert into `customer-mkt-data.u_dsg_saran.Qualified_transactions_BM`
+(Coupon_Event_Id,Coupon_Offer, Event_Start_Date, Event_End_Date,Transaction_date, Qtrans,Qsales,Qcost)
+	select
+	(select D_event[ordinal(i)]),
+	(select D_offer[ordinal(i)]) ,
+	(select D_sdt[ordinal(i)]),
+	(select D_edt[ordinal(i)]),
+  transaction_date,
+	count( distinct concat_key_header) as trans,
+  sum(nsales),
+  sum(cost)
+  from (
+		select distinct transaction_date, concat_key_header,nsales, cost
+		from(
+			select distinct a.concat_key_header,a.transaction_date,ifnull(b.discount,0) discount, cost, d.sales1, a.nsales
+			FROM(
+				(select distinct concat_key_header,transaction_date, sum (regular_price) sales, sum(net_sale_price) nsales, sum(cost) cost
+				from `dsg90544-data-science-prod.marketing.transaction_detail`
+				where transaction_date between
+				(D_sdt[ordinal(i)])
+				and
+				(D_edt[ordinal(i)])
+				and chain_number in (1,3,7) group by 1,2) a
+			join
+				(select distinct concat_key_header, sum(regular_price) sales1 from `dsg90544-data-science-prod.marketing.transaction_detail`
+				where transaction_date between
+			  (D_sdt[ordinal(i)])
+				and
+				(D_edt[ordinal(i)])
+				and quantity >= 1 group by 1) d
+			using (concat_key_header)
+			left join
+				(select distinct concat_key_header,sum(discount_amount) discount
+				from `dsg90544-data-science-prod.marketing.transaction_discount`
+				where transaction_date between
+				(D_sdt[ordinal(i)])
+				and
+				(D_edt[ordinal(i)])
+				and discount_type_id in ('4','24') group by 1) b
+			using (concat_key_header)))
+		where ( sales1 + discount) >= (select Qualifying_Dollars_1 from IData where Coupon_Event_Id =D_event[ordinal(i)] and Coupon_Offer = D_offer[ordinal(i)] and Event_Start_Date=D_sdt[ordinal(i)] and Event_End_Date=D_edt[ordinal(i)]))
+    group by 5;
+
+set i=i+1;
+end while;
+
+/************-------Qualified transactions on Percentage Offer ----------------------******************/
+
+Set P_event=(select array_agg(Coupon_Event_Id order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Percentage_Flag =1);
+Set P_offer = (select array_agg(Coupon_Offer order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Percentage_Flag =1 );
+Set P_sdt=(select array_agg(Event_Start_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Percentage_Flag =1 );
+Set P_edt=(select array_agg(Event_End_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from IData where Percentage_Flag =1 );
+
+
+while j<=array_length(P_offer) do
+insert into `customer-mkt-data.u_dsg_saran.Qualified_transactions_BM`
+(Coupon_Event_Id,Coupon_Offer, Event_Start_Date, Event_End_Date,Transaction_date, Qtrans,Qsales,Qcost)
+	select
+	(select P_event[ordinal(j)]),
+	(select P_offer[ordinal(j)]) ,
+	(select P_sdt[ordinal(j)]),
+	(select P_edt[ordinal(j)]),
+  Transaction_date,
+	count( distinct concat_key_header) as trans,
+  sum(nsales),
+  sum(cost)
+  from (
+		select distinct concat_key_header,Transaction_date,nsales, cost
+		from(
+			select distinct a.concat_key_header,a.Transaction_date,ifnull(b.discount,0) discount, cost, d.sales1, a.nsales
+			FROM(
+				(select distinct concat_key_header, Transaction_date,sum (regular_price) sales, sum(net_sale_price) nsales, sum(cost) cost
+				from `dsg90544-data-science-prod.marketing.transaction_detail`
+				where transaction_date between
+				(P_sdt[ordinal(j)])
+				and
+				(P_edt[ordinal(j)])
+				and chain_number in (1,3,7) group by 1,2) a
+			join
+				(select distinct concat_key_header, sum(regular_price) sales1 from `dsg90544-data-science-prod.marketing.transaction_detail`
+				where transaction_date between
+				(P_sdt[ordinal(j)])
+				and
+				(P_edt[ordinal(j)])
+				and quantity >= 1 group by 1) d
+			using (concat_key_header)
+			left join
+				(select distinct concat_key_header,sum(discount_amount) discount
+				from `dsg90544-data-science-prod.marketing.transaction_discount`
+				where transaction_date between
+				(P_sdt[ordinal(j)])
+				and
+				(P_edt[ordinal(j)])
+				and discount_type_id in ('4','24') group by 1) b
+			using (concat_key_header)))
+--where ( sales1 + discount) >= (select Qualifying_Dollars_1 from DData where Coupon_Event_Id =event[ordinal(i)] and Coupon_Offer = offer[ordinal(i)])
+)group by 5;
+set j=j+1;
+end while;
+
+
+/************-----------------------Final Table for All BM Take Rate-----------------------********/
+Create or replace table `customer-mkt-data.u_dsg_saran.Take_rate_BM` as
+select distinct a.Coupon_event_Id,c.New_Event_Name,a.Event_Start_Date,a.Event_End_Date,a.Coupon_Code,Transaction_date,a.Coupon_Offer,
+Qualified_Transactions,Qualified_Sales,Qualified_Margin,
+from
+(
+  select distinct s.Coupon_Event_Id,s.Event_Start_Date,s.Event_End_Date,s.Coupon_Offer,
+  s.Coupon_Code,
+  r.Transaction_date ,
+  r.Qtrans as Qualified_Transactions,
+  r.Qsales as Qualified_Sales,
+  (r.Qsales-r.Qcost) as Qualified_Margin,
+   --r.Qcost as Qualified_cost,
+  from
+    (
+select distinct  w.Coupon_Event_Id ,w.Event_Start_Date ,w.Event_End_Date ,w.Coupon_Code ,w.Coupon_Offer from
+Takerate_matrix w  where w.Coupon_Code like '%P%' and coupon_code not in (select distinct coupon_code from `customer-mkt-data.u_dsg_saran.Qualified_metrics_Metadata`)) s
+left join
+	`customer-mkt-data.u_dsg_saran.Qualified_transactions_BM` r
+on s.Coupon_Event_Id =r.Coupon_Event_Id and s.Coupon_Offer =r.Coupon_Offer and s.Event_Start_Date =r.Event_Start_Date and s.Event_End_Date =r.Event_End_Date
+group by 1,2,3,4,5,6,7,8,9) a
+left join
+`customer-mkt-data.u_dsg_public.DI_COUPON_EVENT` c
+using(Coupon_event_Id);
+/************************************************************************************************************************************/
+/************************************************Online Qualified metrics Calculation Begins Here************************************/
+/************************************************************************************************************************************/
+
+create or replace table `customer-mkt-data.u_dsg_saran.Qualified_transactions_Online` (
+Coupon_Event_Id string,Coupon_Offer string, Event_Start_Date date, Event_End_Date date, Transaction_date date,Qtrans int64,Qsales FLOAT64,Qmargin FLOAT64 );
+
+/**************-------------Initialize array for promo id's-------------------***********/
+Set OD_event=(select array_agg(Coupon_Event_Id order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData where Dollars_Flag =1);
+Set OD_offer=(select array_agg(Coupon_Offer order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData where Dollars_Flag =1 );
+Set OD_sdt=(select array_agg(Event_Start_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData where Dollars_Flag =1 );
+Set OD_edt=(select array_agg(Event_End_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData where Dollars_Flag =1 );
+
+/******************-----------Qualified transactions for the Dollars offer -----------***************/
+
+while k<=array_length(OD_offer) do
+insert into `customer-mkt-data.u_dsg_saran.Qualified_transactions_Online`
+(Coupon_Event_Id,Coupon_Offer, Event_Start_Date, Event_End_Date,Transaction_date,Qtrans,Qsales,Qmargin)
+	select
+	(select OD_event[ordinal(k)]),
+	(select OD_offer[ordinal(k)]) ,
+	(select OD_sdt[ordinal(k)]),
+	(select OD_edt[ordinal(k)]),
+  parse_date("%Y%m%d",cast(order_date_key as string)) as Transaction_date,
+  Trans,net_sale_price,net_margin
+  from
+  (
+  select distinct order_date_key, count(distinct order_header_key) as Trans,sum(Net_sales) as net_sale_price,sum(Margin) as net_margin
+from
+(select * from
+	(Select distinct order_date_key, order_header_key,
+  sum(orig_tot_extended_amt) Net_sales,Sum(order_margin) Margin ,sum(sku_web_offer_price) Reg_price
+  from
+		(select d.order_date_key,a.order_header_key,c.order_source_code,d.order_sku_key,
+    d.orig_tot_extended_amt,sku_web_offer_price ,
+    (ifnull(d.orig_tot_extended_amt,0) - ifnull(d.orig_tot_units*d.sku_average_cost,0)) as order_margin
+		from `entdata.ecm.order_sku_adjustment_txn` a
+		left join `entdata.ecm.order_sku` d
+		on d.order_header_key=a.order_header_key
+    --and a.adj_units >=1
+		left join `entdata.ecm.order_header` c
+		on d.order_header_key = c.order_header_key
+		where
+		d.order_sku_key <> -1 and c.demand_ind = 1  and
+		parse_date("%Y%m%d",cast(d.order_date_key as string))
+		between OD_sdt[ordinal(k)]  and OD_edt[ordinal(k)])
+    group by 1,2
+    )
+		where Reg_price>= (select Qualifying_Dollars_1 from OData where Coupon_Event_Id =OD_event[ordinal(k)] and Coupon_Offer = OD_offer[ordinal(k)] and Event_Start_Date=OD_sdt[ordinal(k)] and Event_End_Date=OD_edt[ordinal(k)])
+		)
+    group by 1
+  );
+set k=k+1;
+end while;
+
+/*******************--------Qualified transactions on Percentage Offer -------------------***********/
+
+Set OP_event=(select array_agg(Coupon_Event_Id order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData
+where Percentage_Flag =1);
+Set OP_offer = (select array_agg(Coupon_Offer order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData
+where Percentage_Flag =1 );
+Set OP_sdt=(select array_agg(Event_Start_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData
+where Percentage_Flag =1 );
+Set OP_edt=(select array_agg(Event_End_Date order by Coupon_Event_Id,Coupon_Offer,Event_Start_Date,Event_End_Date) from OData
+where Percentage_Flag =1 );
+
+
+while l<=array_length(OP_offer) do
+insert into `customer-mkt-data.u_dsg_saran.Qualified_transactions_Online`
+(Coupon_Event_Id,Coupon_Offer, Event_Start_Date, Event_End_Date,Transaction_date, Qtrans,Qsales,Qmargin)
+	select
+	(select OP_event[ordinal(l)]),
+	(select OP_offer[ordinal(l)]) ,
+	(select OP_sdt[ordinal(l)]),
+	(select OP_edt[ordinal(l)]),
+  parse_date("%Y%m%d",cast(order_date_key as string)) as Transaction_date,
+  Trans,net_sale_price,net_margin
+  from
+  (
+  select distinct order_date_key, count(distinct order_header_key) as Trans,sum(Net_sales) as net_sale_price,sum(Margin) as net_margin
+from
+(select * from
+	(Select distinct order_date_key, order_header_key,sum(orig_tot_extended_amt) Net_sales,Sum(order_margin) Margin
+  from
+		(select d.order_date_key,a.order_header_key,c.order_source_code,d.order_sku_key,
+    d.orig_tot_extended_amt,
+    (ifnull(d.orig_tot_extended_amt,0) - ifnull(d.orig_tot_units*d.sku_average_cost,0)) as order_margin
+		from `entdata.ecm.order_sku_adjustment_txn` a
+		left join `entdata.ecm.order_sku` d
+		on d.order_header_key=a.order_header_key
+    --and a.adj_units >=1
+		left join `entdata.ecm.order_header` c
+		on d.order_header_key = c.order_header_key
+		where
+		d.order_sku_key <> -1 and c.demand_ind = 1  and
+		parse_date("%Y%m%d",cast(d.order_date_key as string))
+		between OP_sdt[ordinal(l)]  and OP_edt[ordinal(l)])
+    group by 1,2
+    )
+		--where Net_sales>= (select Qualifying_Dollars_1 from DData where Coupon_Event_Id =OD_event[ordinal(k)] and Coupon_Offer = OD_offer[ordinal(k)] and Event_Start_Date=OD_sdt[ordinal(k)] and Event_End_Date=OD_edt[ordinal(k)])
+    )
+    group by 1
+    );
+
+set l=l+1;
+end while;
+
+/*******************----------------Creating Final Take Rate for Online ----------------------**************/
+Create or replace table `customer-mkt-data.u_dsg_saran.Take_rate_Online` as
+select distinct a.Coupon_event_Id,c.New_Event_Name,a.Event_Start_Date,a.Event_End_Date,a.Coupon_Code,a.Coupon_Offer ,Transaction_date,
+Qualified_Transactions,Qualified_Sales,Qualified_Margin,
+
+from
+  (select distinct  s.Coupon_Event_Id ,s.Event_Start_Date , s.Event_End_Date,s.Coupon_Offer ,
+  s.Coupon_Code,r.Transaction_date,
+  r.Qtrans as Qualified_Transactions,
+  r.Qsales as Qualified_Sales,
+  r.Qmargin as Qualified_Margin
+  from
+    (select distinct Coupon_Event_Id ,Event_Start_Date ,Event_End_Date ,Coupon_Code,Coupon_Offer
+      from Takerate_matrix  where Coupon_Code  not like '%P%' and coupon_code not in (select distinct coupon_code from  `customer-mkt-data.u_dsg_public.fa_coupon_event_qualifying_transactions`)) s
+  left join
+	  `customer-mkt-data.u_dsg_saran.Qualified_transactions_Online` r
+	   on s.Coupon_Event_Id =r.Coupon_Event_Id and s.Coupon_Offer =r.Coupon_Offer
+     and s.Event_Start_Date =r.Event_Start_Date and s.Event_End_Date =r.Event_End_Date
+group by 1,2,3,4,5,6,7,8,9) a
+left join
+`customer-mkt-data.u_dsg_public.DI_COUPON_EVENT` c
+using(Coupon_event_Id)
+;
+
+/********************************************************************************************************************************/
+/*********************-------------Final Union of Both BM and Online Qualified metrics ------------------************************/
+/********************************************************************************************************************************/
+
+insert into  `customer-mkt-data.u_dsg_public.fa_coupon_event_qualifying_transactions`
+SELECT Coupon_event_Id, New_Event_Name, Event_Start_Date, Event_End_Date, Coupon_Code, Coupon_Offer, Transaction_date , Qualified_Transactions as Qualifying_Transactions, Qualified_Sales as Qualifying_Sales, Qualified_Margin as Qualifying_Margin FROM `customer-mkt-data.u_dsg_saran.Take_rate_Online`
+union all
+SELECT Coupon_event_Id, New_Event_Name, Event_Start_Date, Event_End_Date, Coupon_Code, Coupon_Offer,Transaction_date , Qualified_Transactions as Qualifying_Transactions, Qualified_Sales as Qualifying_Sales, Qualified_Margin as Qualifying_Margin FROM `customer-mkt-data.u_dsg_saran.Take_rate_BM`;
+End
+
+/***********************************************************END***************************************************************/
